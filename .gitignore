@@ -1,1 +1,8 @@
-checkpoints
+*.pth
+*.pth.gz
+checkpoints/
+__pycache__/
+*.pyc
+*.egg-info/
+.env
+demo-imgs/
