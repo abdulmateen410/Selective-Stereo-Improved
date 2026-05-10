@@ -180,6 +180,10 @@ class SceneFlowDatasets(StereoDataset):
 class ETH3D(StereoDataset):
     def __init__(self, aug_params=None, root='/data/StereoDatasets/eth3d', split='training'):
         super(ETH3D, self).__init__(aug_params, sparse=True)
+        if root is None:
+            raise ValueError("ETH3D dataset root is None. Please provide a valid root path with --dataset_root.")
+        if not os.path.exists(root):
+            raise ValueError(f"Dataset root directory does not exist: {root}. Please download the ETH3D dataset and specify the correct path with --dataset_root.")
         assert os.path.exists(root)
 
         image1_list = sorted( glob(osp.join(root, f'two_view_{split}/*/im0.png')) )
@@ -284,19 +288,24 @@ class InStereo2K(StereoDataset):
 class KITTI(StereoDataset):
     def __init__(self, aug_params=None, root='/data/StereoDatasets/kitti', image_set='training', year=2015):
         super(KITTI, self).__init__(aug_params, sparse=True, reader=frame_utils.readDispKITTI)
-        assert os.path.exists(root)
+        if root is None:
+            raise ValueError("KITTI dataset root is None. Please provide a valid root path with --dataset_root.")
+        if not os.path.exists(root):
+            raise ValueError(f"Dataset root directory does not exist: {root}.")
+
+        image1_list = []
+        image2_list = []
+        disp_list = []
 
         if year == 2012:
-            root_12 = '/data/StereoDatasets/kitti/2012'
-            image1_list = sorted(glob(os.path.join(root_12, image_set, 'colored_0/*_10.png')))
-            image2_list = sorted(glob(os.path.join(root_12, image_set, 'colored_1/*_10.png')))
-            disp_list = sorted(glob(os.path.join(root_12, 'training', 'disp_occ/*_10.png'))) if image_set == 'training' else [osp.join(root, 'training/disp_occ/000085_10.png')]*len(image1_list)
+            image1_list += sorted(glob(os.path.join(root, image_set, 'colored_0/*_10.png')))
+            image2_list += sorted(glob(os.path.join(root, image_set, 'colored_1/*_10.png')))
+            disp_list += sorted(glob(os.path.join(root, 'training', 'disp_occ/*_10.png'))) if image_set == 'training' else [osp.join(root, 'training/disp_occ/000085_10.png')]*len(image1_list)
 
         if year == 2015:
-            root_15 = '/data/StereoDatasets/kitti/2015'
-            image1_list += sorted(glob(os.path.join(root_15, image_set, 'image_2/*_10.png')))
-            image2_list += sorted(glob(os.path.join(root_15, image_set, 'image_3/*_10.png')))
-            disp_list += sorted(glob(os.path.join(root_15, 'training', 'disp_occ_0/*_10.png'))) if image_set == 'training' else [osp.join(root, 'training/disp_occ_0/000085_10.png')]*len(image1_list)
+            image1_list += sorted(glob(os.path.join(root, image_set, 'image_2/*_10.png')))
+            image2_list += sorted(glob(os.path.join(root, image_set, 'image_3/*_10.png')))
+            disp_list += sorted(glob(os.path.join(root, 'training', 'disp_occ_0/*_10.png'))) if image_set == 'training' else [osp.join(root, 'training/disp_occ_0/000085_10.png')]*len(image1_list)
 
         for idx, (img1, img2, disp) in enumerate(zip(image1_list, image2_list, disp_list)):
             self.image_list += [ [img1, img2] ]
@@ -305,6 +314,10 @@ class KITTI(StereoDataset):
 class Middlebury(StereoDataset):
     def __init__(self, aug_params=None, root='/data/StereoDatasets/middlebury', split='2014', resolution='F'):
         super(Middlebury, self).__init__(aug_params, sparse=True, reader=frame_utils.readDispMiddlebury)
+        if root is None:
+            raise ValueError("Middlebury dataset root is None. Please provide a valid root path with --dataset_root.")
+        if not os.path.exists(root):
+            raise ValueError(f"Dataset root directory does not exist: {root}. Please download the Middlebury dataset and specify the correct path with --dataset_root.")
         assert os.path.exists(root)
         assert split in ["2005", "2006", "2014", "2021", "MiddEval3"]
         if split == "2005":
@@ -366,12 +379,10 @@ def fetch_dataloader(args):
             new_dataset = SceneFlowDatasets(aug_params, dstype='frames_finalpass')
             logging.info(f"Adding {len(new_dataset)} samples from SceneFlow")
         elif 'kitti' in dataset_name:
-            kitti12 = KITTI(aug_params, year=2012)
-            logging.info(f"Adding {len(kitti12)} samples from KITTI 2012")
-            kitti15 = KITTI(aug_params, year=2015)
-            logging.info(f"Adding {len(kitti15)} samples from KITTI 2015")
-            new_dataset = kitti12 + kitti15
-            logging.info(f"Adding {len(new_dataset)} samples from KITTI") 
+            kitti_root = getattr(args, 'dataset_root', '/data/StereoDatasets/kitti')
+            kitti15 = KITTI(aug_params, root=kitti_root, year=2015)
+            new_dataset = kitti15
+            logging.info(f"Adding {len(new_dataset)} samples from KITTI 2015")
         elif dataset_name == 'eth3d_train':
             tartanair = TartanAir(aug_params)
             logging.info(f"Adding {len(tartanair)} samples from Tartain Air")
@@ -448,7 +459,7 @@ def fetch_dataloader(args):
         train_dataset = new_dataset if train_dataset is None else train_dataset + new_dataset
 
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 
-        pin_memory=True, shuffle=True, num_workers=8, drop_last=True)
+        pin_memory=True, shuffle=True, num_workers=0, drop_last=True)
 
     logging.info('Training with %d image pairs' % len(train_dataset))
     return train_loader

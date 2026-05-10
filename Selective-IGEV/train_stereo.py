@@ -2,6 +2,7 @@ from __future__ import print_function, division
 
 import argparse
 import logging
+from sched import scheduler
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -20,7 +21,7 @@ import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
 
 try:
-    from torch.cuda.amp import GradScaler
+    from torch.amp import GradScaler
 except:
     class GradScaler:
         def __init__(self):
@@ -39,16 +40,19 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, loss_gamma=0.9, ma
 
     n_predictions = len(disp_preds)
     assert n_predictions >= 1
-    disp_loss = 0.0
+    disp_loss = torch.tensor(0.0, device=disp_gt.device, dtype=disp_gt.dtype, requires_grad=True)
     # exlude invalid pixels and extremely large diplacements
     mag = torch.sum(disp_gt**2, dim=1).sqrt()
 
     # exclude extremly large displacements
-    valid = ((valid >= 0.5) & (mag < max_disp)).unsqueeze(1)
+    valid_gt = (~torch.isnan(disp_gt) & ~torch.isinf(disp_gt)).squeeze(1)
+    valid = ((valid >= 0.5) & (mag < max_disp) & valid_gt).unsqueeze(1)
     assert valid.shape == disp_gt.shape, [valid.shape, disp_gt.shape]
     assert not torch.isinf(disp_gt[valid.bool()]).any()
 
-    disp_loss += 1.0 * F.smooth_l1_loss(disp_init_pred[valid.bool()], disp_gt[valid.bool()], size_average=True)
+    valid_mask = valid.bool()
+    if valid_mask.sum() > 0:
+        disp_loss = disp_loss + 1.0 * F.smooth_l1_loss(disp_init_pred[valid_mask], disp_gt[valid_mask], size_average=True)
     for i in range(n_predictions):
         assert not torch.isnan(disp_preds[i]).any() and not torch.isinf(disp_preds[i]).any()
         # We adjust the loss_gamma so it is consistent for any number of Selective-IGEV iterations
@@ -56,17 +60,26 @@ def sequence_loss(disp_preds, disp_init_pred, disp_gt, valid, loss_gamma=0.9, ma
         i_weight = adjusted_loss_gamma**(n_predictions - i - 1)
         i_loss = (disp_preds[i] - disp_gt).abs()
         assert i_loss.shape == valid.shape, [i_loss.shape, valid.shape, disp_gt.shape, disp_preds[i].shape]
-        disp_loss += i_weight * i_loss[valid.bool()].mean()
+        if valid_mask.sum() > 0:
+            disp_loss = disp_loss + i_weight * i_loss[valid_mask].mean()
 
     epe = torch.sum((disp_preds[-1] - disp_gt)**2, dim=1).sqrt()
     epe = epe.view(-1)[valid.view(-1)]
 
-    metrics = {
-        'epe': epe.mean().item(),
-        '1px': (epe < 1).float().mean().item(),
-        '3px': (epe < 3).float().mean().item(),
-        '5px': (epe < 5).float().mean().item(),
-    }
+    if epe.numel() == 0:
+        metrics = {
+            'epe': 0.0,
+            '1px': 0.0,
+            '3px': 0.0,
+            '5px': 0.0,
+        }
+    else:
+        metrics = {
+            'epe': epe.mean().item(),
+            '1px': (epe < 1).float().mean().item(),
+            '3px': (epe < 3).float().mean().item(),
+            '5px': (epe < 5).float().mean().item(),
+        }
     return disp_loss, metrics
 
 def fetch_optimizer(args, model):
@@ -138,7 +151,7 @@ def train(args):
         assert args.restore_ckpt.endswith(".pth")
         logging.info("Loading checkpoint...")
         checkpoint = torch.load(args.restore_ckpt)
-        model.load_state_dict(checkpoint, strict=True)
+        model.load_state_dict(checkpoint, strict=False)
         logging.info(f"Done loading checkpoint")
     model.cuda()
     model.train()
@@ -146,7 +159,7 @@ def train(args):
 
     validation_frequency = 10000
 
-    scaler = GradScaler(enabled=args.mixed_precision)
+    scaler = GradScaler('cuda', enabled=args.mixed_precision)
 
     should_keep_training = True
     global_batch_num = 0
@@ -164,14 +177,17 @@ def train(args):
             logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
             logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
             global_batch_num += 1
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            scaler.step(optimizer)
+            if args.mixed_precision and args.precision_dtype == 'float16':
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
             scheduler.step()
-            scaler.update()
-            logger.push(metrics)
 
             if total_steps % validation_frequency == validation_frequency - 1:
                 save_path = Path(args.logdir + '/%d_%s.pth' % (total_steps + 1, args.name))
@@ -249,6 +265,7 @@ if __name__ == '__main__':
     parser.add_argument('--do_flip', default=False, choices=['h', 'v'], help='flip the images horizontally or vertically')
     parser.add_argument('--spatial_scale', type=float, nargs='+', default=[-0.2, 0.4], help='re-scale the images randomly')
     parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
+    parser.add_argument('--dataset_root', default='/data/StereoDatasets/kitti', help='path to dataset root')
     args = parser.parse_args()
 
     torch.manual_seed(666)

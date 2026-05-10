@@ -19,7 +19,7 @@ import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
 
 try:
-    from torch.cuda.amp import GradScaler
+    from torch.amp import GradScaler
 except:
     # dummy GradScaler for PyTorch < 1.6
     class GradScaler:
@@ -39,15 +39,17 @@ def sequence_loss(disp_preds, disp_gt, valid, loss_gamma=0.9, max_disp=192):
 
     n_predictions = len(disp_preds)
     assert n_predictions >= 1
-    disp_loss = 0.0
+    disp_loss = torch.tensor(0.0, device=disp_gt.device, dtype=disp_gt.dtype, requires_grad=True)
     # exlude invalid pixels and extremely large diplacements
     mag = torch.sum(disp_gt ** 2, dim=1).sqrt()
 
     # exclude extremly large displacements
-    valid = ((valid >= 0.5) & (mag < max_disp)).unsqueeze(1)
+    valid_gt = (~torch.isnan(disp_gt) & ~torch.isinf(disp_gt)).squeeze(1)
+    valid = ((valid >= 0.5) & (mag < max_disp) & valid_gt).unsqueeze(1)
     assert valid.shape == disp_gt.shape, [valid.shape, disp_gt.shape]
     assert not torch.isinf(disp_gt[valid.bool()]).any()
 
+    valid_mask = valid.bool()
     for i in range(n_predictions):
         assert not torch.isnan(disp_preds[i]).any() and not torch.isinf(disp_preds[i]).any()
         # We adjust the loss_gamma so it is consistent for any number of Selective-RAFT iterations
@@ -55,17 +57,26 @@ def sequence_loss(disp_preds, disp_gt, valid, loss_gamma=0.9, max_disp=192):
         i_weight = adjusted_loss_gamma ** (n_predictions - i - 1)
         i_loss = (disp_preds[i] - disp_gt).abs()
         assert i_loss.shape == valid.shape, [i_loss.shape, valid.shape, disp_gt.shape, disp_preds[i].shape]
-        disp_loss += i_weight * i_loss[valid.bool()].mean()
+        if valid_mask.sum() > 0:
+            disp_loss = disp_loss + i_weight * i_loss[valid_mask].mean()
 
     epe = torch.sum((disp_preds[-1] - disp_gt)**2, dim=1).sqrt()
     epe = epe.view(-1)[valid.view(-1)]
 
-    metrics = {
-        'epe': epe.mean().item(),
-        '1px': (epe < 1).float().mean().item(),
-        '3px': (epe < 3).float().mean().item(),
-        '5px': (epe < 5).float().mean().item(),
-    }
+    if epe.numel() == 0:
+        metrics = {
+            'epe': 0.0,
+            '1px': 0.0,
+            '3px': 0.0,
+            '5px': 0.0,
+        }
+    else:
+        metrics = {
+            'epe': epe.mean().item(),
+            '1px': (epe < 1).float().mean().item(),
+            '3px': (epe < 3).float().mean().item(),
+            '5px': (epe < 5).float().mean().item(),
+        }
 
     return disp_loss, metrics
 
@@ -150,7 +161,7 @@ def train(args):
 
     validation_frequency = 10000
 
-    scaler = GradScaler(enabled=args.mixed_precision)
+    scaler = GradScaler('cuda', enabled=args.mixed_precision)
 
     should_keep_training = True
     global_batch_num = 0

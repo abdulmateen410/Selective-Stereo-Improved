@@ -1,22 +1,30 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import nullcontext
 from core.update import BasicSelectiveMultiUpdateBlock, SpatialAttentionExtractor, ChannelAttentionEnhancement
 from core.extractor import MultiBasicEncoder, Feature
 from core.geometry import Combined_Geo_Encoding_Volume
 from core.submodule import *
 
 
-try:
-    autocast = torch.cuda.amp.autocast
-except:
-    class autocast:
-        def __init__(self, enabled):
-            pass
-        def __enter__(self):
-            pass
-        def __exit__(self, *args):
-            pass
+class Autocast:
+    def __init__(self, enabled, dtype=torch.float16):
+        self.enabled = enabled
+        self.dtype = dtype
+        self._autocast = None
+
+    def __enter__(self):
+        if self.enabled:
+            self._autocast = torch.amp.autocast('cuda', dtype=self.dtype)
+            return self._autocast.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        if self.enabled and self._autocast is not None:
+            self._autocast.__exit__(*args)
+
+autocast = Autocast
 
 class hourglass(nn.Module):
     def __init__(self, in_channels):
@@ -63,6 +71,10 @@ class hourglass(nn.Module):
         self.feature_att_up_16 = FeatureAtt(in_channels*4, 192)
         self.feature_att_up_8 = FeatureAtt(in_channels*2, 64)
 
+
+
+    
+
     def forward(self, x, features):
         conv1 = self.conv1(x)
         conv1 = self.feature_att_8(conv1, features[1])
@@ -86,6 +98,43 @@ class hourglass(nn.Module):
         conv = self.conv1_up(conv1)
 
         return conv
+
+class BoundaryAwareBlock(nn.Module):
+    """
+    Post-processing block that sharpens disparity boundaries.
+    Takes predicted disparity + left image as input,
+    applies edge-sensitive correction near object boundaries.
+    """
+    def __init__(self):
+        super(BoundaryAwareBlock, self).__init__()
+        # 4 input channels: 1 (disparity) + 3 (RGB image)
+        self.edge_conv = nn.Sequential(
+            nn.Conv2d(4, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 8, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 1, kernel_size=3, padding=1, bias=False)
+        )
+        # Initialize last layer to zero so it starts as identity
+        nn.init.zeros_(self.edge_conv[-1].weight)
+
+    def forward(self, disp, image):
+        # Normalize image to [0,1] range for input
+        image_norm = (image + 1.0) / 2.0
+        # Resize image to match disparity size if needed
+        if image_norm.shape[2:] != disp.shape[2:]:
+            image_norm = F.interpolate(
+                image_norm, size=disp.shape[2:],
+                mode='bilinear', align_corners=True
+            )
+        # Concatenate disparity and image
+        x = torch.cat([disp, image_norm], dim=1)
+        # Predict boundary correction
+        correction = self.edge_conv(x)
+        # Residual: add small correction to disparity
+        return disp + correction
 
 class IGEVStereo(nn.Module):
     def __init__(self, args):
@@ -130,6 +179,7 @@ class IGEVStereo(nn.Module):
         self.corr_feature_att = FeatureAtt(8, 96)
         self.cost_agg = hourglass(8)
         self.classifier = nn.Conv3d(8, 1, 3, 1, 1, bias=False)
+        self.boundary_block = BoundaryAwareBlock()
 
     def freeze_bn(self):
         for m in self.modules():
@@ -209,7 +259,10 @@ class IGEVStereo(nn.Module):
             disp_preds.append(disp_up)
 
         if test_mode:
+            disp_up = self.boundary_block(disp_up, image1)
             return disp_up
 
         init_disp = context_upsample(init_disp*4., spx_pred.float()).unsqueeze(1)
+        # Apply boundary refinement to final prediction
+        disp_preds[-1] = self.boundary_block(disp_preds[-1], image1)
         return init_disp, disp_preds

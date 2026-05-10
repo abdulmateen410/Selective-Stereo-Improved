@@ -20,11 +20,11 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 @torch.no_grad()
-def validate_eth3d(model, iters=32, mixed_prec=False):
+def validate_eth3d(model, iters=32, mixed_prec=False, root=None):
     """ Peform validation using the ETH3D (train) split """
     model.eval()
     aug_params = {}
-    val_dataset = datasets.ETH3D(aug_params)
+    val_dataset = datasets.ETH3D(aug_params, root=root)
 
     out_list, epe_list = [], []
     for val_id in range(len(val_dataset)):
@@ -65,11 +65,13 @@ def validate_eth3d(model, iters=32, mixed_prec=False):
 
 
 @torch.no_grad()
-def validate_kitti(model, iters=32, mixed_prec=False, year=2015):
+def validate_kitti(model, iters=32, mixed_prec=False, year=2015, root=None):
     """ Peform validation using the KITTI (train) split """
+    if root is None:
+        root = 'C:\\Users\\nawaz\\datasets\\kitti15'
     model.eval()
     aug_params = {}
-    val_dataset = datasets.KITTI(aug_params, image_set='training', year=year)
+    val_dataset = datasets.KITTI(aug_params, root=root, image_set='training', year=year)
     torch.backends.cudnn.benchmark = True
 
     out_list, epe_list, elapsed_list = [], [], []
@@ -155,11 +157,11 @@ def validate_sceneflow(model, iters=32, mixed_prec=False):
 
 
 @torch.no_grad()
-def validate_middlebury(model, iters=32, split='MiddEval3', mixed_prec=False, resolution='F'):
+def validate_middlebury(model, iters=32, split='MiddEval3', mixed_prec=False, resolution='F', root=None):
     """ Peform validation using the Middlebury-V3 dataset """
     model.eval()
     aug_params = {}
-    val_dataset = datasets.Middlebury(aug_params, split=split, resolution=resolution)
+    val_dataset = datasets.Middlebury(aug_params, root=root, split=split, resolution=resolution)
 
     out_list, epe_list = [], []
     for val_id in range(len(val_dataset)):
@@ -204,6 +206,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--restore_ckpt', help="restore checkpoint", default=None)
     parser.add_argument('--dataset', help="dataset for evaluation", default='sceneflow', choices=["eth3d", "kitti", "sceneflow", "middlebury"])
+    parser.add_argument('--dataset_root', help="root directory for dataset", default=None)
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
     parser.add_argument("--precision_dtype",default="float16",choices=["float16", "bfloat16", "float32"],help="Choose precision type: float16 or bfloat16 or float32")
     parser.add_argument('--valid_iters', type=int, default=32, help='number of flow-field updates during forward pass')
@@ -219,6 +222,14 @@ if __name__ == '__main__':
     parser.add_argument('--n_gru_layers', type=int, default=3, help="number of hidden GRU levels")
     parser.add_argument('--max_disp', type=int, default=192, help="max disp of geometry encoding volume")
     args = parser.parse_args()
+    if args.dataset_root is not None:
+        args.dataset_root = os.path.abspath(os.path.expanduser(os.path.expandvars(args.dataset_root)))
+
+    if args.dataset in ['kitti', 'eth3d', 'middlebury']:
+        if args.dataset_root is None:
+            raise ValueError(f"--dataset_root must be specified for dataset '{args.dataset}'")
+        if not os.path.exists(args.dataset_root):
+            raise ValueError(f"Dataset root directory does not exist: {args.dataset_root}")
 
     model = torch.nn.DataParallel(IGEVStereo(args), device_ids=[0])
 
@@ -228,8 +239,8 @@ if __name__ == '__main__':
     if args.restore_ckpt is not None:
         assert args.restore_ckpt.endswith(".pth")
         logging.info("Loading checkpoint...")
-        checkpoint = torch.load(args.restore_ckpt)
-        model.load_state_dict(checkpoint, strict=True)
+        checkpoint = torch.load(args.restore_ckpt, weights_only=True)
+        model.load_state_dict(checkpoint, strict=False)
         logging.info(f"Done loading checkpoint")
 
     model.cuda()
@@ -239,13 +250,13 @@ if __name__ == '__main__':
     use_mixed_precision = args.corr_implementation.endswith("_cuda")
 
     if args.dataset == 'eth3d':
-        validate_eth3d(model, iters=args.valid_iters, mixed_prec=use_mixed_precision)
+        validate_eth3d(model, iters=args.valid_iters, mixed_prec=use_mixed_precision, root=args.dataset_root)
 
     if args.dataset == 'kitti':
-        validate_kitti(model, iters=args.valid_iters, mixed_prec=use_mixed_precision)
+        validate_kitti(model, iters=args.valid_iters, mixed_prec=use_mixed_precision, root=args.dataset_root)
 
     if args.dataset == 'middlebury':
-        validate_middlebury(model, iters=args.valid_iters, mixed_prec=use_mixed_precision, resolution='F')
+        validate_middlebury(model, iters=args.valid_iters, mixed_prec=use_mixed_precision, resolution='F', root=args.dataset_root)
 
     if args.dataset == 'sceneflow':
         validate_sceneflow(model, iters=args.valid_iters, mixed_prec=use_mixed_precision)

@@ -148,7 +148,33 @@ class SelectiveConvGRU(nn.Module):
         h = self.small_gru(h, x) * att + self.large_gru(h, x) * (1 - att)
 
         return h
+class DomainAdaptiveFreqSelector(nn.Module):
+    """
+    Simplified domain-adaptive frequency selector.
+    Uses only mean statistics (avoids var() NaN issues).
+    """
+    def __init__(self, feat_dim=128):
+        super(DomainAdaptiveFreqSelector, self).__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Linear(feat_dim, feat_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(feat_dim, feat_dim),
+            nn.Sigmoid()
+        )
+        # Initialize to identity — weights start near 1
+        nn.init.zeros_(self.mlp[0].weight)
+        nn.init.zeros_(self.mlp[0].bias)
+        nn.init.zeros_(self.mlp[2].weight)
+        nn.init.ones_(self.mlp[2].bias)
 
+    def forward(self, features):
+        # Use average pooling instead of manual mean/var
+        stats = self.pool(features).squeeze(-1).squeeze(-1)  # (B, C)
+        weights = self.mlp(stats)                             # (B, C)
+        weights = weights.unsqueeze(2).unsqueeze(3)           # (B, C, 1, 1)
+        return features * weights
+    
 class BasicMotionEncoder(nn.Module):
     def __init__(self, args):
         super(BasicMotionEncoder, self).__init__()
@@ -228,32 +254,36 @@ class BasicSelectiveMultiUpdateBlock(nn.Module):
 
         if args.n_gru_layers == 3:
             self.gru16 = SelectiveConvGRU(hidden_dims[0], hidden_dims[0] + hidden_dims[1])
+            self.freq_selector16 = DomainAdaptiveFreqSelector(hidden_dims[0])  # ADD THIS
         if args.n_gru_layers >= 2:
             self.gru08 = SelectiveConvGRU(hidden_dims[1], hidden_dims[0] * (args.n_gru_layers == 3) + hidden_dims[1] + hidden_dims[2])
+            self.freq_selector08 = DomainAdaptiveFreqSelector(hidden_dims[1])  # ADD THIS
         self.gru04 = SelectiveConvGRU(hidden_dims[2], encoder_output_dim + hidden_dims[1] * (args.n_gru_layers > 1) + hidden_dims[2])
+        self.freq_selector04 = DomainAdaptiveFreqSelector(hidden_dims[2])      # ADD THIS
         self.disp_head = DispHead(hidden_dims[2], 256)
 
         self.mask_feat_4 = nn.Sequential(
             nn.Conv2d(hidden_dims[2], 32, 3, padding=1),
             nn.ReLU(inplace=True))
-
     def forward(self, net, inp, corr, disp, att):
         if self.args.n_gru_layers == 3:
+            net[2] = self.freq_selector16(net[2])          # ADD THIS
             net[2] = self.gru16(att[2], net[2], inp[2], pool2x(net[1]))
         if self.args.n_gru_layers >= 2:
             if self.args.n_gru_layers > 2:
+                net[1] = self.freq_selector08(net[1])      # ADD THIS
                 net[1] = self.gru08(att[1], net[1], inp[1], pool2x(net[0]), interp(net[2], net[1]))
             else:
+                net[1] = self.freq_selector08(net[1])      # ADD THIS
                 net[1] = self.gru08(att[1], net[1], inp[1], pool2x(net[0]))
         
         motion_features = self.encoder(disp, corr)
-        
         motion_features = torch.cat([inp[0], motion_features], dim=1)
+        
+        net[0] = self.freq_selector04(net[0])              # ADD THIS
         if self.args.n_gru_layers > 1:
             net[0] = self.gru04(att[0], net[0], motion_features, interp(net[1], net[0]))
 
         delta_disp = self.disp_head(net[0])
-
-        # scale mask to balence gradients
         mask_feat_4 = .25 * self.mask_feat_4(net[0])
         return net, mask_feat_4, delta_disp
